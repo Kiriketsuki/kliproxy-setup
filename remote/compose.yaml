@@ -1,0 +1,54 @@
+# Two proxy processes. Personal and work accounts never share a pool.
+# Each container publishes to the loopback address only. Tailscale serve is the single entry.
+name: claude-hub
+
+x-proxy: &proxy
+  image: ${HUB_IMAGE}
+  restart: unless-stopped
+  environment:
+    TZ: Asia/Singapore
+
+services:
+  personal:
+    <<: *proxy
+    container_name: claude-hub-personal
+    ports:
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - ./personal/config.yaml:/CLIProxyAPI/config.yaml
+      - ./personal/auth:/root/.cli-proxy-api
+      - ./personal/logs:/CLIProxyAPI/logs
+
+  work:
+    <<: *proxy
+    container_name: claude-hub-work
+    ports:
+      - "127.0.0.1:8318:8317"
+    volumes:
+      - ./work/config.yaml:/CLIProxyAPI/config.yaml
+      - ./work/auth:/root/.cli-proxy-api
+      - ./work/logs:/CLIProxyAPI/logs
+
+  # Sets the credential priority from the quota signals, so the pool spends first the
+  # quota that expires first. It uses the management API only.
+  router:
+    image: python:3.12-alpine
+    container_name: claude-hub-router
+    restart: unless-stopped
+    depends_on: [personal, work]
+    command: ["python", "/app/router.py"]
+    environment:
+      TZ: Asia/Singapore
+      ROUTER_POOLS: "personal=http://personal:8317 work=http://work:8317"
+      ROUTER_INTERVAL_SECONDS: "60"
+      # A seat takes new sessions by its weekly rank until its 5-hour window is at
+      # 95 percent. From 98 percent it is the last choice.
+      ROUTER_5H_WARM: "0.95"
+      ROUTER_5H_LIMIT: "0.98"
+      ROUTER_5H_WEIGHT: "0"
+    ports:
+      - "127.0.0.1:8319:8320"
+    volumes:
+      - ./router:/app:ro
+      - ./keys:/keys:ro
+      - ./router-state:/state

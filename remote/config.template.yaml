@@ -1,0 +1,28 @@
+# CLIProxyAPI config, v8 layout. init-remote.sh fills the two placeholders on the hub host.
+config-version: 8
+server:
+  # The container binds all addresses. Compose publishes the port to 127.0.0.1 only.
+  host: ""
+  port: 8317
+management:
+  # Requests arrive through the Docker bridge, so the proxy sees them as remote.
+  allow-remote: true
+  secret-key: "__MGMT_KEY__"
+access:
+  api-keys:
+    - "__ACCESS_KEY__"
+routing:
+  strategy: "round-robin"
+  # One thread stays on one account. This keeps the prompt cache of that account.
+  session-affinity: true
+  session-affinity-ttl: "1h"
+  session-affinity-rebind-on: "quota"
+  retry:
+    request-retry: 3
+    max-retry-interval: 30
+requests:
+  # Forwards the upstream response headers to the client. Claude Code then gets the
+  # rate-limit numbers of the seat that served the request, for its statusline.
+  passthrough-headers: true
+oauth:
+  auth-dir: "~/.cli-proxy-api"

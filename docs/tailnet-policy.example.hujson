@@ -1,0 +1,35 @@
+// Example grants that limit the hub ports to the tailnet owner.
+// Merge these entries into your own policy. Do not replace your policy with this file.
+//
+// Tailscale rules only allow. If a different grant already lets each member reach the
+// hub host on all ports, these grants limit nothing. In that case give the hub host a
+// tag, as shown here, and make sure that no other grant opens the hub ports on that tag.
+//
+// After you save the policy, give the hub machine the tag "tag:hub"
+// (Machines, Edit ACL tags). Save the policy first.
+{
+    "tagOwners": {
+        "tag:hub": ["autogroup:owner"],
+    },
+
+    "grants": [
+        // Everyone keeps access to the hub host, except the hub ports 8317 to 8319.
+        {
+            "src": ["autogroup:member", "autogroup:admin", "autogroup:owner"],
+            "dst": ["tag:hub"],
+            "ip":  ["tcp:1-8316", "tcp:8320-65535", "udp:*", "icmp:*"],
+        },
+        // Only the tailnet owner reaches the hub ports.
+        {
+            "src": ["autogroup:owner"],
+            "dst": ["tag:hub"],
+            "ip":  ["tcp:8317-8319"],
+        },
+        // The hub host keeps its outbound access.
+        {
+            "src": ["tag:hub"],
+            "dst": ["autogroup:member", "autogroup:admin", "autogroup:owner"],
+            "ip":  ["*"],
+        },
+    ],
+}
