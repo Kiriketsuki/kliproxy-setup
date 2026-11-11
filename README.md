@@ -1,4 +1,4 @@
-# cliproxy-hub
+# kliproxy-setup
 
 A setup kit for a [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) hub for
 Claude Code. One host holds the Claude logins. Each client reaches the host through
@@ -48,7 +48,7 @@ The idea comes from this guide:
    of the account. The browser then fails on a `localhost:54545` page. Paste that address
    at the prompt. Press `a` for one more account.
 4. Run `./verify.sh`. The model count must be above zero for each pool.
-5. Add `source /path/to/cliproxy-hub/client/claude-hub.zsh` to `~/.zshrc`, with the
+5. Add `source /path/to/kliproxy-setup/client/claude-hub.zsh` to `~/.zshrc`, with the
    settings that the file describes.
 6. On each other client, set `hub.env` and run `./client-setup.sh`.
 7. Limit the hub ports on your tailnet. See `docs/tailnet-policy.example.hujson`.

@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/hub.env" ] || { echo "Copy hub.env.example to hub.env and set your values." >&2; exit 2; }
 . "$HERE/hub.env"
 
-BACKUP_DIR="${HUB_BACKUP_DIR:-$HOME/.local/share/cliproxy-hub-backups}"
+BACKUP_DIR="${HUB_BACKUP_DIR:-$HOME/.local/share/kliproxy-backups}"
 PASS_FILE="$HUB_KEY_DIR/backup.pass"
 KEEP=14
 
