@@ -146,3 +146,7 @@ copy invalid.
 - The hub cannot tell a client which seat serves a session. The reset-time match gives it.
 - Claude Desktop chat does not use the hub. It talks to claude.ai, not to the API endpoint.
 - The router tests need Python 3.11 or later: `cd remote/router && python3 -m unittest test_router`.
+
+## License
+
+MIT. See `LICENSE`.
