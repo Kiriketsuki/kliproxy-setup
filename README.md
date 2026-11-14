@@ -91,6 +91,11 @@ already runs stays on its seat, so the prompt cache stays valid. The `ROUTER_*` 
 A seat change is costly. The session sends its whole history again as a cache write. Keep
 the context of a long session small.
 
+If a work seat has reset but sessions still get quota errors, run `./reroute.sh`. It
+restarts the work proxy and router to clear cached cooldowns and seat assignments. It
+briefly interrupts work requests. In each paused Claude session, press Esc if it is
+waiting for a reset, then enter `continue`. This does not reset account quotas.
+
 ## Spend guard
 
 An account with extra usage bills each request after its included quota ends. The router
@@ -124,6 +129,7 @@ The [chrysaki-claude](https://github.com/Kiriketsuki/chrysaki-claude) statusline
 | `login.sh` | client | Signs accounts in. Takes `--host` and `--dir`. |
 | `verify.sh` | client | Checks each pool through the tailnet |
 | `status.sh` | client | Shows the state of each seat |
+| `reroute.sh` | client | Restarts the work proxy and router to clear cached routing state |
 | `backup.sh` | client | Writes one encrypted archive of the hub state |
 | `client/claude-hub.zsh` | client | The shell function |
 | `remote/` | host | Compose file, config template, first-run script, router |
