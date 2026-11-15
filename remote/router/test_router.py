@@ -4,7 +4,7 @@ import unittest
 
 from dataclasses import replace
 
-from router import Seat, guard_until, plan, read_seat, state_of, window
+from router import Seat, guard_until, mark_reserve, parse_reserve, plan, read_seat, state_of, window
 
 
 def seat(name, week_used, week_hours_left, five_hour_used=0.0, unavailable=False):
@@ -50,6 +50,41 @@ class PlanTest(unittest.TestCase):
     def test_seat_with_no_signal_gets_the_top_priority(self):
         result = plan([seat("known", 0.0, 1), seat("unknown", None, None)])
         self.assertGreater(result["unknown"], result["known"])
+
+
+class ReserveTest(unittest.TestCase):
+    def test_reserve_seat_goes_below_each_open_and_warm_seat(self):
+        spare = replace(seat("spare", 0.0, 1), reserve=True)
+        seats = [spare, seat("open", 0.9, 160), seat("warm", 0.9, 160, five_hour_used=0.9)]
+        seats += [seat(f"low{n}", 0.9, 160 * 2**n) for n in range(1, 12)]
+        result = plan(seats)
+        for name, priority in result.items():
+            if name != "spare":
+                self.assertGreater(priority, result["spare"], name)
+
+    def test_reserve_seat_goes_above_each_full_seat(self):
+        spare = replace(seat("spare", 0.5, 50), reserve=True)
+        result = plan([spare, seat("five", 0.1, 5, five_hour_used=1.0), seat("week", 0.99, 5)])
+        self.assertGreater(result["spare"], result["five"])
+        self.assertGreater(result["spare"], result["week"])
+
+    def test_reserve_seat_with_no_signal_stays_in_reserve(self):
+        spare = replace(seat("spare", None, None), reserve=True)
+        result = plan([spare, seat("open", 0.9, 160)])
+        self.assertGreater(result["open"], result["spare"])
+
+    def test_full_reserve_seat_ranks_as_a_full_seat(self):
+        spare = replace(seat("spare", 0.99, 5), reserve=True)
+        result = plan([spare, seat("five", 0.1, 5, five_hour_used=1.0)])
+        self.assertLess(result["spare"], result["five"])
+
+    def test_reserve_list_is_read_per_pool(self):
+        reserve = parse_reserve("work=spare,extra other=one bad =x")
+        self.assertEqual(reserve, {"work": frozenset({"spare", "extra"}), "other": frozenset({"one"})})
+        self.assertEqual(parse_reserve(""), {})
+
+    def test_seat_outside_the_reserve_list_is_not_marked(self):
+        self.assertFalse(mark_reserve(seat("a", 0.1, 5), "work").reserve)
 
 
 class SignalTest(unittest.TestCase):

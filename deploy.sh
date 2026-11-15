@@ -18,9 +18,10 @@ tar -C "$HERE/remote" --exclude=__pycache__ -cf - . | ssh "$HUB_SSH" "sudo -n mk
   && sudo -n sh '$HUB_DIR/init-remote.sh' ${pools[*]}"
 
 echo "deploy: start containers"
-ssh "$HUB_SSH" "cd / && sudo -n env HUB_IMAGE='$HUB_IMAGE' $HUB_DOCKER compose \
+compose_env="HUB_IMAGE='$HUB_IMAGE' HUB_RESERVE='${HUB_RESERVE:-}'"
+ssh "$HUB_SSH" "cd / && sudo -n env $compose_env $HUB_DOCKER compose \
   --project-directory '$HUB_DIR' -f '$HUB_DIR/compose.yaml' up -d --force-recreate router \
-  && sudo -n env HUB_IMAGE='$HUB_IMAGE' $HUB_DOCKER compose --project-directory '$HUB_DIR' -f '$HUB_DIR/compose.yaml' up -d"
+  && sudo -n env $compose_env $HUB_DOCKER compose --project-directory '$HUB_DIR' -f '$HUB_DIR/compose.yaml' up -d"
 
 echo "deploy: open the ports on the tailnet"
 ports=("$HUB_STATUS_PORT")

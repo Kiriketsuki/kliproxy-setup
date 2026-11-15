@@ -80,6 +80,7 @@ same priority take new sessions in turn. The router sets the priority each 60 se
 |---|---|---|
 | `open` | 5-hour use under 95 percent | 100, 90, 80 by score |
 | `warm` | 5-hour use from 95 percent | 40, 30 by score |
+| reserve | Named in `HUB_RESERVE`, and `open` or `warm` | 6 |
 | `five_hour_full` | 5-hour use from 98 percent, or in cooldown | 5 |
 | `week_full` | 7-day use from 97 percent | 0 |
 
@@ -87,6 +88,19 @@ The score is the weekly quota that is left, divided by the hours to the weekly r
 Seats whose score is within 15 percent of the best one share a priority. A session that
 already runs stays on its seat, so the prompt cache stays valid. The `ROUTER_*` values in
 `remote/compose.yaml` set each limit.
+
+### Reserve seats
+
+A reserve seat serves a pool only when each other seat of that pool is full. Name it in
+`hub.env`, then run `./deploy.sh`:
+
+```
+HUB_RESERVE="work=my-spare-seat"
+```
+
+The name is the part of the account email before the @ sign. A session that moved to a
+reserve seat stays there while it is active, up to the affinity time of one hour.
+`./reroute.sh` moves it back at once.
 
 A seat change is costly. The session sends its whole history again as a cache write. Keep
 the context of a long session small.

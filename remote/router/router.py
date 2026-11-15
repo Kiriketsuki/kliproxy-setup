@@ -20,7 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,9 +47,26 @@ STATUS_PORT = int(os.environ.get("ROUTER_STATUS_PORT", "8320"))
 WEEK_HOURS = 168.0
 PRIORITY_STEP = 10
 TIER_TOP = {"open": 100, "warm": 40}
+# A reserve seat with quota sits below each open or warm seat and above each full seat.
+PRIORITY_RESERVE = 6
 PRIORITY_FIVE_HOUR_FULL = 5
 PRIORITY_WEEK_FULL = 0
 SIGNAL_PREFIX = "Anthropic-Ratelimit-Unified-"
+
+
+def parse_reserve(text: str) -> dict[str, frozenset[str]]:
+    """Reads 'pool=seat,seat pool=seat' into the reserve seat labels of each pool."""
+    reserve: dict[str, frozenset[str]] = {}
+    for item in text.split():
+        pool, _, labels = item.partition("=")
+        names = frozenset(label for label in labels.split(",") if label)
+        if pool and names:
+            reserve[pool] = names
+    return reserve
+
+
+# A reserve seat takes a new session only when no other seat of its pool has quota.
+RESERVE = parse_reserve(os.environ.get("ROUTER_RESERVE", ""))
 
 # The management list does not always return the priority field. This record of the
 # last value that the router sent stops a repeat of the same write in each cycle.
@@ -74,6 +91,8 @@ class Seat:
     five_hour_reset_epoch: int | None = None
     # True when the account can bill extra usage after its included quota.
     overage_open: bool = False
+    # True when the seat serves only while each other seat of its pool is full.
+    reserve: bool = False
 
 
 def log(message: str) -> None:
@@ -152,6 +171,11 @@ def read_seat(entry: dict, now: float) -> Seat:
     )
 
 
+def mark_reserve(seat: Seat, pool: str) -> Seat:
+    """Returns the seat with its reserve flag set from the reserve list of the pool."""
+    return replace(seat, reserve=seat.label in RESERVE.get(pool, frozenset()))
+
+
 def state_of(seat: Seat) -> str:
     if seat.week_used is not None and seat.week_used >= SEVEN_DAY_LIMIT:
         return "week_full"
@@ -192,7 +216,7 @@ def rank_tier(seats: list[Seat], top: int) -> dict[str, int]:
         elif not value >= group_best * SHARE_RATIO:
             priority -= PRIORITY_STEP
             group_best = value
-        priorities[seat.name] = max(priority, PRIORITY_FIVE_HOUR_FULL + 1)
+        priorities[seat.name] = max(priority, PRIORITY_RESERVE + 1)
     return priorities
 
 
@@ -206,6 +230,8 @@ def plan(seats: list[Seat]) -> dict[str, int]:
             priorities[seat.name] = PRIORITY_WEEK_FULL
         elif state == "five_hour_full":
             priorities[seat.name] = PRIORITY_FIVE_HOUR_FULL
+        elif seat.reserve:
+            priorities[seat.name] = PRIORITY_RESERVE
         else:
             tiers[state].append(seat)
     for state, members in tiers.items():
@@ -287,6 +313,7 @@ def describe(seat: Seat, priority: int) -> dict:
         "week_reset_epoch": seat.week_reset_epoch,
         "five_hour_reset_epoch": seat.five_hour_reset_epoch,
         "unavailable": seat.unavailable,
+        "reserve": seat.reserve,
     }
 
 
@@ -297,7 +324,7 @@ def route_pool(pool: str, base_url: str) -> None:
     entries = [entry for entry in listing.get("files", []) if entry.get("type") == "claude"]
     guarded = apply_guard(pool, base_url, key, entries, now)
     seats = [
-        read_seat(entry, now)
+        mark_reserve(read_seat(entry, now), pool)
         for entry in entries
         if not entry.get("disabled") and entry["name"] not in guarded
     ]
@@ -379,6 +406,8 @@ def main() -> int:
         log("ROUTER_POOLS is empty. Set it to 'pool=url pool=url'.")
         return 2
     log(f"router started. Pools: {', '.join(pools)}. Interval: {INTERVAL_SECONDS} s.")
+    for pool, labels in RESERVE.items():
+        log(f"{pool}: reserve seats: {', '.join(sorted(labels))}")
     once = "--once" in sys.argv
     if not once:
         serve_status()
