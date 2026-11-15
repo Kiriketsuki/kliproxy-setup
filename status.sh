@@ -19,7 +19,7 @@ for entry in $HUB_POOLS; do
     def hrs: if . == null then "-" else "\(.)h" end;
     "\(.pool)  next seat: \(.next_seat // "-")  (updated \(.updated))",
     (["  seat", "priority", "state", "week used", "week reset", "5h used", "5h reset"] | @tsv),
-    (.seats[] | ["  " + .seat, .priority, .state, (.week_used | pct), (.week_hours_left | hrs),
+    (.seats[] | ["  " + .seat, .priority, .state + (if (.weight // 1) != 1 then " x\(.weight)" else "" end), (.week_used | pct), (.week_hours_left | hrs),
       (.five_hour_used | pct), (.five_hour_hours_left | hrs)] | @tsv)' | column -t -s $'\t'
   echo
 done

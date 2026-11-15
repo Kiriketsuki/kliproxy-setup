@@ -4,7 +4,7 @@ import unittest
 
 from dataclasses import replace
 
-from router import Seat, guard_until, plan, read_seat, state_of, window
+from router import Seat, guard_until, parse_weights, plan, read_seat, state_of, window
 
 
 def seat(name, week_used, week_hours_left, five_hour_used=0.0, unavailable=False):
@@ -52,6 +52,113 @@ class PlanTest(unittest.TestCase):
         self.assertGreater(result["unknown"], result["known"])
 
 
+class WeightTest(unittest.TestCase):
+    def test_weight_multiplies_the_priority(self):
+        result = plan([seat("main", 0.5, 50), replace(seat("half", 0.5, 50), weight=0.5)])
+        self.assertEqual(result["main"], 100)
+        self.assertEqual(result["half"], 50)
+
+    def test_weighted_seats_rank_apart_from_the_other_seats(self):
+        spare = replace(seat("spare", None, None), weight=0.5)
+        result = plan([spare, seat("main", 0.9, 160)])
+        self.assertEqual(result["main"], 100)
+        self.assertEqual(result["spare"], 50)
+
+    def test_smaller_weight_goes_below_larger_weight(self):
+        half = replace(seat("half", 0.0, 1), weight=0.5)
+        quarter = replace(seat("quarter", 0.0, 1), weight=0.25)
+        result = plan([quarter, half, seat("main", 0.9, 160)])
+        self.assertGreater(result["main"], result["half"])
+        self.assertGreater(result["half"], result["quarter"])
+
+    def test_weighted_seat_with_quota_stays_above_each_full_seat(self):
+        last = replace(seat("last", 0.5, 50), weight=0.01)
+        result = plan([last, seat("five", 0.1, 5, five_hour_used=1.0), seat("week", 0.99, 5)])
+        self.assertGreater(result["last"], result["five"])
+        self.assertGreater(result["last"], result["week"])
+
+    def test_full_weighted_seat_ranks_as_a_full_seat(self):
+        spare = replace(seat("spare", 0.99, 5), weight=0.5)
+        result = plan([spare, seat("five", 0.1, 5, five_hour_used=1.0)])
+        self.assertLess(result["spare"], result["five"])
+
+    def test_no_weight_keeps_the_priorities(self):
+        seats = [seat("a", 0.2, 10), seat("b", 0.2, 120), seat("c", 0.1, 5, five_hour_used=0.9)]
+        weighted = [replace(item, weight=1.0) for item in seats]
+        self.assertEqual(plan(seats), plan(weighted))
+
+    def test_weights_are_read_per_pool(self):
+        weights, errors = parse_weights("work=spare:0.5,extra:0.25 other=one:2")
+        self.assertEqual(weights, {"work": {"spare": 0.5, "extra": 0.25}, "other": {"one": 2.0}})
+        self.assertEqual(errors, [])
+        self.assertEqual(parse_weights(""), ({}, []))
+
+    def test_bad_weight_items_are_reported_and_ignored(self):
+        weights, errors = parse_weights("work=ok:0.5,zero:0,word:x,noweight bad =x:1")
+        self.assertEqual(weights, {"work": {"ok": 0.5}})
+        self.assertEqual(len(errors), 5)
+
+
+class ProviderTest(unittest.TestCase):
+    def test_seats_of_two_types_rank_apart(self):
+        codex = replace(seat("codex", 0.9, 160), kind="codex")
+        result = plan([seat("claude", 0.1, 10), codex])
+        self.assertEqual(result["claude"], 100)
+        self.assertEqual(result["codex"], 100)
+
+    def test_codex_windows_are_read_by_their_length(self):
+        entry = {"name": "c.json", "type": "codex", "quota": {"signals": {
+            "X-Codex-Primary-Used-Percent": "51",
+            "X-Codex-Primary-Window-Minutes": "10080",
+            "X-Codex-Primary-Reset-At": "8200",
+            "X-Codex-Secondary-Used-Percent": "20",
+            "X-Codex-Secondary-Window-Minutes": "300",
+            "X-Codex-Secondary-Reset-At": "4600",
+        }}}
+        result = read_seat(entry, now=1000.0)
+        self.assertEqual((result.week_used, result.week_hours_left, result.week_reset_epoch), (0.51, 2.0, 8200))
+        self.assertEqual((result.five_hour_used, result.five_hour_hours_left), (0.2, 1.0))
+        self.assertFalse(result.overage_open)
+
+    def test_codex_slot_names_decide_when_no_length_is_given(self):
+        entry = {"name": "c.json", "type": "codex", "quota": {
+            "observed_at": "2026-01-01T00:00:00+00:00",
+            "signals": {
+                "x-codex-primary-used-percent": "99",
+                "x-codex-primary-reset-after-seconds": "3600",
+                "x-codex-secondary-used-percent": "10",
+            },
+        }}
+        observed = 1767225600.0
+        result = read_seat(entry, now=observed + 1800)
+        self.assertEqual((result.five_hour_used, result.five_hour_hours_left), (0.99, 0.5))
+        self.assertEqual(result.week_used, 0.1)
+        self.assertEqual(state_of(result), "five_hour_full")
+
+    def test_codex_window_that_ended_is_empty(self):
+        entry = {"name": "c.json", "type": "codex", "quota": {"signals": {
+            "X-Codex-Primary-Used-Percent": "100", "X-Codex-Primary-Window-Minutes": "300",
+            "X-Codex-Primary-Reset-At": "500",
+        }}}
+        self.assertEqual(read_seat(entry, now=1000.0).five_hour_used, 0.0)
+
+    def test_seat_of_an_unknown_type_has_no_quota_view(self):
+        entry = {"name": "g.json", "type": "other", "quota": {"signals": {
+            "Anthropic-Ratelimit-Unified-7d-Utilization": "0.99",
+        }}}
+        result = read_seat(entry, now=1.0)
+        self.assertIsNone(result.week_used)
+        self.assertEqual(state_of(result), "open")
+
+    def test_claude_signal_names_match_in_any_case(self):
+        entry = {"name": "a.json", "type": "claude", "quota": {"signals": {
+            "anthropic-ratelimit-unified-7d-utilization": "0.5",
+            "ANTHROPIC-RATELIMIT-UNIFIED-7D-RESET": "4600",
+        }}}
+        result = read_seat(entry, now=1000.0)
+        self.assertEqual((result.week_used, result.week_hours_left, result.week_reset_epoch), (0.5, 1.0, 4600))
+
+
 class SignalTest(unittest.TestCase):
     def test_past_reset_means_an_empty_window(self):
         signals = {
@@ -91,9 +198,9 @@ class GuardTest(unittest.TestCase):
         self.assertIsNone(guard_until(open_seat))
 
     def test_overage_signal_is_read(self):
-        entry = {"name": "a.json", "quota": {"signals": {"Anthropic-Ratelimit-Unified-Overage-Status": "allowed"}}}
+        entry = {"name": "a.json", "type": "claude", "quota": {"signals": {"Anthropic-Ratelimit-Unified-Overage-Status": "allowed"}}}
         self.assertTrue(read_seat(entry, now=1.0).overage_open)
-        entry = {"name": "a.json", "quota": {"signals": {"Anthropic-Ratelimit-Unified-Overage-Status": "rejected"}}}
+        entry = {"name": "a.json", "type": "claude", "quota": {"signals": {"Anthropic-Ratelimit-Unified-Overage-Status": "rejected"}}}
         self.assertFalse(read_seat(entry, now=1.0).overage_open)
 
 

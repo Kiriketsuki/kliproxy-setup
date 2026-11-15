@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Signs Claude accounts into the hub pools. Run it in your own terminal.
+# Signs accounts into the hub pools. Run it in your own terminal.
 # It stays open, so you can add several accounts in one run.
 #
-# Usage: login.sh [pool] [--host SSH_TARGET] [--dir HUB_DIR]
+# Usage: login.sh [pool] [--provider NAME] [--host SSH_TARGET] [--dir HUB_DIR]
 #   pool         personal or work. The script asks when you give none.
+#   --provider   claude or codex. Default: claude.
 #   --host       SSH alias or user@hostname of the hub host. Default: HUB_SSH in hub.env.
 #   --dir        Hub directory on that host. Default: HUB_DIR in hub.env.
 #
@@ -11,8 +12,8 @@
 # that connection.
 #
 # The script uses no SSH tunnel, because a hub host can refuse port forwards.
-# The browser fails on the localhost:54545 page. You paste that address here, and the
-# script sends it to the login container on the hub host.
+# The browser fails on a localhost page. You paste that address here, and the script
+# sends it to the login container on the hub host.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,11 +21,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/hub.env" ] || { echo "Copy hub.env.example to hub.env and set your values." >&2; exit 2; }
 . "$HERE/hub.env"
 
-usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 pool=""
+provider="claude"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --provider) provider="${2:?--provider needs a value}"; shift 2 ;;
     --host) HUB_SSH="${2:?--host needs a value}"; shift 2 ;;
     --dir) HUB_DIR="${2:?--dir needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -32,6 +35,14 @@ while [ $# -gt 0 ]; do
     *) pool="$1"; shift ;;
   esac
 done
+
+# Each provider has its own login flag, callback port and login URL. The provider
+# registers the callback port, so the script cannot change it.
+case "$provider" in
+  claude) login_flag="-claude-login"; login_port=54545; login_url='https://claude\.ai/[^[:space:]]+' ;;
+  codex) login_flag="-codex-login"; login_port=1455; login_url='https://auth\.openai\.com/[^[:space:]]+' ;;
+  *) echo "Unknown provider '$provider'. Use claude or codex." >&2; exit 2 ;;
+esac
 
 pool_names=()
 for entry in $HUB_POOLS; do pool_names+=("${entry%%:*}"); done
@@ -45,7 +56,7 @@ if [ -t 1 ]; then B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; N=$'
 else B=""; D=""; G=""; R=""; N=""; fi
 
 # One shared connection serves each call. LogLevel hides the key exchange warning.
-sock="${XDG_RUNTIME_DIR:-/tmp}/claude-hub-login-$$.sock"
+sock="${XDG_RUNTIME_DIR:-/tmp}/hub-login-$$.sock"
 ssh_opts=(-o LogLevel=ERROR -o ControlPath="$sock")
 hssh() { ssh "${ssh_opts[@]}" "$@"; }
 
@@ -58,7 +69,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-printf '%sClaude hub login%s  host: %s%s%s\n\n' "$B" "$N" "$B" "$HUB_SSH" "$N"
+printf '%sHub login%s  provider: %s%s%s  host: %s%s%s\n\n' "$B" "$N" "$B" "$provider" "$N" "$B" "$HUB_SSH" "$N"
 
 # This call opens the shared connection. SSH asks for a password here if it needs one.
 if ! ssh "${ssh_opts[@]}" -o ControlMaster=yes -o ControlPersist=900 -fN "$HUB_SSH"; then
@@ -91,7 +102,7 @@ fi
 
 accounts() {
   hssh -n "$HUB_SSH" "ls '$HUB_DIR/$1/auth' 2>/dev/null || sudo -n ls '$HUB_DIR/$1/auth'" \
-    | sed -nE 's/^claude-[0-9a-f]+-(.+)\.json$/\1/p' | sort
+    | sed -nE 's/^([a-z]+)-([0-9a-f]{6,}-)?(.+)\.json$/\3 (\1)/p' | sort
 }
 
 show_pools() {
@@ -138,16 +149,16 @@ login_once() {
   # A one-shot container shares the pool config and auth directory.
   # It publishes the callback port on the hub host loopback only.
   hssh -n "$HUB_SSH" "$RUN run -dit --name $name \
-    -p 127.0.0.1:54545:54545 \
+    -p 127.0.0.1:$login_port:$login_port \
     -v '$HUB_DIR/$pool/config.yaml:/CLIProxyAPI/config.yaml' \
     -v '$HUB_DIR/$pool/auth:/root/.cli-proxy-api' \
-    '$HUB_IMAGE' ./CLIProxyAPI -claude-login -no-browser" >/dev/null
+    '$HUB_IMAGE' ./CLIProxyAPI $login_flag -no-browser" >/dev/null
 
   # The login process needs about 8 seconds before it prints the URL.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 3
     url="$(hssh -n "$HUB_SSH" "$RUN logs $name 2>&1" | tr -d '\r' \
-      | grep -Eo 'https://claude\.ai/[^[:space:]]+' | head -1 || true)"
+      | grep -Eo "$login_url" | head -1 || true)"
     [ -n "$url" ] && break
   done
   if [ -z "$url" ]; then
@@ -161,7 +172,7 @@ ${B}1.${N} Open this URL in the browser of the account that you want to add:
 
 ${D}${url}${N}
 
-${B}2.${N} Approve. The browser then fails on a localhost:54545 page. That is correct.
+${B}2.${N} Approve. The browser then fails on a localhost:${login_port} page. That is correct.
 ${B}3.${N} Copy that address from the address bar and paste it below.
 
 EOF
@@ -179,13 +190,13 @@ EOF
   done
 
   case "$callback" in
-    http://localhost:54545/*|http://127.0.0.1:54545/*) ;;
-    *) echo "${R}The address must start with http://localhost:54545/. Nothing was sent.${N}"; return 1 ;;
+    "http://localhost:$login_port/"*|"http://127.0.0.1:$login_port/"*) ;;
+    *) echo "${R}The address must start with http://localhost:$login_port/. Nothing was sent.${N}"; return 1 ;;
   esac
-  path="${callback#http://*:54545}"
+  path="${callback#http://*:"$login_port"}"
 
   # The address goes through stdin, so no shell on the way reads its special characters.
-  status="$(printf '%s\n' "http://127.0.0.1:54545$path" | hssh "$HUB_SSH" \
+  status="$(printf '%s\n' "http://127.0.0.1:$login_port$path" | hssh "$HUB_SSH" \
     'read -r u && curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$u"' || true)"
   sleep 4
 
