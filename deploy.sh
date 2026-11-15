@@ -18,7 +18,7 @@ tar -C "$HERE/remote" --exclude=__pycache__ -cf - . | ssh "$HUB_SSH" "sudo -n mk
   && sudo -n sh '$HUB_DIR/init-remote.sh' ${pools[*]}"
 
 echo "deploy: start containers"
-compose_env="HUB_IMAGE='$HUB_IMAGE' HUB_RESERVE='${HUB_RESERVE:-}'"
+compose_env="HUB_IMAGE='$HUB_IMAGE' HUB_SEAT_WEIGHTS='${HUB_SEAT_WEIGHTS:-}'"
 ssh "$HUB_SSH" "cd / && sudo -n env $compose_env $HUB_DOCKER compose \
   --project-directory '$HUB_DIR' -f '$HUB_DIR/compose.yaml' up -d --force-recreate router \
   && sudo -n env $compose_env $HUB_DOCKER compose --project-directory '$HUB_DIR' -f '$HUB_DIR/compose.yaml' up -d"

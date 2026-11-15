@@ -46,8 +46,8 @@ services:
       ROUTER_5H_WARM: "0.95"
       ROUTER_5H_LIMIT: "0.98"
       ROUTER_5H_WEIGHT: "0"
-      # Reserve seats, from HUB_RESERVE in hub.env. deploy.sh passes the value.
-      ROUTER_RESERVE: "${HUB_RESERVE:-}"
+      # Seat weights, from HUB_SEAT_WEIGHTS in hub.env. deploy.sh passes the value.
+      ROUTER_SEAT_WEIGHTS: "${HUB_SEAT_WEIGHTS:-}"
     ports:
       - "127.0.0.1:8319:8320"
     volumes:

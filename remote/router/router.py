@@ -6,6 +6,10 @@ the priority from the quota signals that the proxy records per account. The pool
 spends first the weekly quota that expires first, and it keeps new sessions away from a
 seat whose 5-hour window is almost full.
 
+The quota signals are the rate-limit headers of the upstream service. A reader exists for
+Claude and for Codex accounts. A seat of a different type has no quota view. The router
+then ranks it by its weight and its cooldown only.
+
 The program reads and writes through the management API only. It never reads a token.
 It also serves the pool state on a read-only HTTP endpoint for the client statusline.
 """
@@ -47,32 +51,58 @@ STATUS_PORT = int(os.environ.get("ROUTER_STATUS_PORT", "8320"))
 WEEK_HOURS = 168.0
 PRIORITY_STEP = 10
 TIER_TOP = {"open": 100, "warm": 40}
-# A reserve seat with quota sits below each open or warm seat and above each full seat.
-PRIORITY_RESERVE = 6
 PRIORITY_FIVE_HOUR_FULL = 5
+# The lowest priority of a seat with quota. Each full seat is below it.
+PRIORITY_FLOOR = PRIORITY_FIVE_HOUR_FULL + 1
 PRIORITY_WEEK_FULL = 0
-SIGNAL_PREFIX = "Anthropic-Ratelimit-Unified-"
+# The proxy stores the header names of the upstream. The router compares them in lower case.
+SIGNAL_PREFIX = "anthropic-ratelimit-unified-"
+# A Codex window longer than this is the weekly window. A shorter one is the 5-hour window.
+DAY_MINUTES = 1440.0
 
 
-def parse_reserve(text: str) -> dict[str, frozenset[str]]:
-    """Reads 'pool=seat,seat pool=seat' into the reserve seat labels of each pool."""
-    reserve: dict[str, frozenset[str]] = {}
+def parse_weights(text: str) -> tuple[dict[str, dict[str, float]], list[str]]:
+    """Reads 'pool=seat:0.5,seat:0.25 pool=seat:0.1' into the seat weights of each pool.
+
+    Returns the weights and one message for each item that it cannot read.
+    """
+    weights: dict[str, dict[str, float]] = {}
+    errors: list[str] = []
     for item in text.split():
-        pool, _, labels = item.partition("=")
-        names = frozenset(label for label in labels.split(",") if label)
-        if pool and names:
-            reserve[pool] = names
-    return reserve
+        pool, _, pairs = item.partition("=")
+        if not pool or not pairs:
+            errors.append(f"'{item}' is not 'pool=seat:weight'")
+            continue
+        for pair in pairs.split(","):
+            label, _, value = pair.rpartition(":")
+            weight = as_float(value)
+            if not label or weight is None or not 0.0 < weight < float("inf"):
+                errors.append(f"'{pair}' in pool '{pool}' is not 'seat:weight' with a weight above 0")
+                continue
+            weights.setdefault(pool, {})[label] = weight
+    return weights, errors
 
 
-# A reserve seat takes a new session only when no other seat of its pool has quota.
-RESERVE = parse_reserve(os.environ.get("ROUTER_RESERVE", ""))
+def as_float(value: object) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+# The weight multiplies the priority of a seat that has quota. A seat with no entry has
+# the weight 1.
+WEIGHTS, WEIGHT_ERRORS = parse_weights(os.environ.get("ROUTER_SEAT_WEIGHTS", ""))
+# The account types that the router ranks. Empty means each type.
+SEAT_TYPES = frozenset(os.environ.get("ROUTER_SEAT_TYPES", "").replace(",", " ").split())
 
 # The management list does not always return the priority field. This record of the
 # last value that the router sent stops a repeat of the same write in each cycle.
 _sent: dict[tuple[str, str], int] = {}
 # The newest state of each pool, for the status endpoint.
 _latest: dict[str, dict] = {}
+# The weight entries that name no seat, and that the log already has.
+_reported: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -91,8 +121,10 @@ class Seat:
     five_hour_reset_epoch: int | None = None
     # True when the account can bill extra usage after its included quota.
     overage_open: bool = False
-    # True when the seat serves only while each other seat of its pool is full.
-    reserve: bool = False
+    # The account type that the proxy gives, for example "claude" or "codex".
+    kind: str = ""
+    # Multiplies the priority of the seat while it has quota.
+    weight: float = 1.0
 
 
 def log(message: str) -> None:
@@ -112,13 +144,6 @@ def call(base_url: str, key: str, method: str, path: str, body: dict | None = No
     return json.loads(text) if text.strip() else {}
 
 
-def as_float(value: object) -> float | None:
-    try:
-        return float(str(value))
-    except (TypeError, ValueError):
-        return None
-
-
 def parse_time(value: object) -> float | None:
     """Returns the epoch seconds of an ISO time, or None when the value is not one."""
     if not isinstance(value, str) or not value:
@@ -129,51 +154,105 @@ def parse_time(value: object) -> float | None:
         return None
 
 
-def window(signals: dict, name: str, now: float) -> tuple[float | None, float | None]:
-    """Returns (utilization, hours until reset) for one rate-limit window.
+def lowered(signals: dict) -> dict:
+    return {str(name).lower(): value for name, value in signals.items()}
+
+
+def settle(used: float | None, reset: float | None, now: float) -> tuple[float | None, float | None, int | None]:
+    """Returns (utilization, hours until reset, reset time) for one rate-limit window.
 
     A reset time in the past means that the window ended. The seat is then empty,
     and its next window starts with the next request.
     """
-    used = as_float(signals.get(f"{SIGNAL_PREFIX}{name}-Utilization"))
-    reset = as_float(signals.get(f"{SIGNAL_PREFIX}{name}-Reset"))
     if reset is None:
-        return used, None
+        return used, None, None
     if reset <= now:
-        return 0.0, None
-    return used, (reset - now) / 3600.0
+        return 0.0, None, None
+    return used, (reset - now) / 3600.0, int(reset)
+
+
+def window(signals: dict, name: str, now: float) -> tuple[float | None, float | None]:
+    """Returns (utilization, hours until reset) for one Claude rate-limit window."""
+    return claude_window(lowered(signals), name, now)[:2]
+
+
+def claude_window(signals: dict, name: str, now: float) -> tuple[float | None, float | None, int | None]:
+    used = as_float(signals.get(f"{SIGNAL_PREFIX}{name}-utilization"))
+    return settle(used, as_float(signals.get(f"{SIGNAL_PREFIX}{name}-reset")), now)
+
+
+def claude_quota(signals: dict, now: float, observed: float | None) -> dict:
+    """Reads the unified rate-limit headers of a Claude account."""
+    week_used, week_hours_left, week_reset = claude_window(signals, "7d", now)
+    five_hour_used, five_hour_hours_left, five_hour_reset = claude_window(signals, "5h", now)
+    return {
+        "week_used": week_used,
+        "week_hours_left": week_hours_left,
+        "week_reset_epoch": week_reset,
+        "five_hour_used": five_hour_used,
+        "five_hour_hours_left": five_hour_hours_left,
+        "five_hour_reset_epoch": five_hour_reset,
+        "overage_open": str(signals.get(f"{SIGNAL_PREFIX}overage-status", "rejected")).lower() != "rejected",
+    }
+
+
+def codex_quota(signals: dict, now: float, observed: float | None) -> dict:
+    """Reads the primary and secondary rate-limit headers of a Codex account.
+
+    The window length tells which window a header set describes. A plan can have only
+    one of the two windows, so the slot name alone does not tell.
+    """
+    quota: dict = {}
+    for slot in ("primary", "secondary"):
+        percent = as_float(signals.get(f"x-codex-{slot}-used-percent"))
+        if percent is None:
+            continue
+        minutes = as_float(signals.get(f"x-codex-{slot}-window-minutes"))
+        reset = as_float(signals.get(f"x-codex-{slot}-reset-at"))
+        after = as_float(signals.get(f"x-codex-{slot}-reset-after-seconds"))
+        if reset is None and after is not None and observed is not None:
+            reset = observed + after
+        weekly = minutes > DAY_MINUTES if minutes is not None else slot == "secondary"
+        used, hours_left, reset_epoch = settle(percent / 100.0, reset, now)
+        name = "week" if weekly else "five_hour"
+        quota.update({f"{name}_used": used, f"{name}_hours_left": hours_left, f"{name}_reset_epoch": reset_epoch})
+    return quota
+
+
+# One reader per account type. Each reader returns the quota fields of a seat.
+QUOTA_READERS = {"claude": claude_quota, "codex": codex_quota}
 
 
 def read_seat(entry: dict, now: float) -> Seat:
-    signals = (entry.get("quota") or {}).get("signals") or {}
-    week_used, week_hours_left = window(signals, "7d", now)
-    five_hour_used, five_hour_hours_left = window(signals, "5h", now)
+    quota = entry.get("quota") or {}
+    kind = str(entry.get("type") or entry.get("provider") or "").lower()
+    reader = QUOTA_READERS.get(kind)
+    fields = reader(lowered(quota.get("signals") or {}), now, parse_time(quota.get("observed_at"))) if reader else {}
     priority = entry.get("priority")
-    week_reset = as_float(signals.get(f"{SIGNAL_PREFIX}7d-Reset"))
-    five_hour_reset = as_float(signals.get(f"{SIGNAL_PREFIX}5h-Reset"))
     # The proxy marks a seat unavailable for a cooldown and gives the retry time. A retry
     # time in the past means that the cooldown ended, so the flag no longer counts.
     retry_at = parse_time(entry.get("next_retry_after"))
     blocked = bool(entry.get("unavailable")) and (retry_at is None or retry_at > now)
+    # A client matches the reset times with its own rate-limit data to find its seat.
     return Seat(
         name=entry["name"],
         label=str(entry.get("email") or entry["name"]).split("@")[0],
         current_priority=priority if isinstance(priority, int) else None,
         unavailable=blocked,
-        week_used=week_used,
-        week_hours_left=week_hours_left,
-        five_hour_used=five_hour_used,
-        five_hour_hours_left=five_hour_hours_left,
-        # A client matches these times with its own rate-limit data to find its seat.
-        week_reset_epoch=int(week_reset) if week_reset and week_reset > now else None,
-        five_hour_reset_epoch=int(five_hour_reset) if five_hour_reset and five_hour_reset > now else None,
-        overage_open=str(signals.get(f"{SIGNAL_PREFIX}Overage-Status", "rejected")).lower() != "rejected",
+        week_used=fields.get("week_used"),
+        week_hours_left=fields.get("week_hours_left"),
+        five_hour_used=fields.get("five_hour_used"),
+        five_hour_hours_left=fields.get("five_hour_hours_left"),
+        week_reset_epoch=fields.get("week_reset_epoch"),
+        five_hour_reset_epoch=fields.get("five_hour_reset_epoch"),
+        overage_open=bool(fields.get("overage_open", False)),
+        kind=kind,
     )
 
 
-def mark_reserve(seat: Seat, pool: str) -> Seat:
-    """Returns the seat with its reserve flag set from the reserve list of the pool."""
-    return replace(seat, reserve=seat.label in RESERVE.get(pool, frozenset()))
+def with_weight(seat: Seat, pool: str) -> Seat:
+    """Returns the seat with the weight that the settings give it in this pool."""
+    return replace(seat, weight=WEIGHTS.get(pool, {}).get(seat.label, 1.0))
 
 
 def state_of(seat: Seat) -> str:
@@ -216,26 +295,29 @@ def rank_tier(seats: list[Seat], top: int) -> dict[str, int]:
         elif not value >= group_best * SHARE_RATIO:
             priority -= PRIORITY_STEP
             group_best = value
-        priorities[seat.name] = max(priority, PRIORITY_RESERVE + 1)
+        priorities[seat.name] = max(priority, PRIORITY_FLOOR)
     return priorities
 
 
 def plan(seats: list[Seat]) -> dict[str, int]:
-    """Returns the priority for each seat name."""
+    """Returns the priority for each seat name.
+
+    Seats of one type and one weight rank against each other. The weight then multiplies
+    the priority. A seat with quota never goes below a full seat.
+    """
     priorities: dict[str, int] = {}
-    tiers: dict[str, list[Seat]] = {"open": [], "warm": []}
+    groups: dict[tuple[str, float, str], list[Seat]] = {}
     for seat in seats:
         state = state_of(seat)
         if state == "week_full":
             priorities[seat.name] = PRIORITY_WEEK_FULL
         elif state == "five_hour_full":
             priorities[seat.name] = PRIORITY_FIVE_HOUR_FULL
-        elif seat.reserve:
-            priorities[seat.name] = PRIORITY_RESERVE
         else:
-            tiers[state].append(seat)
-    for state, members in tiers.items():
-        priorities.update(rank_tier(members, TIER_TOP[state]))
+            groups.setdefault((seat.kind, seat.weight, state), []).append(seat)
+    for (_, weight, state), members in groups.items():
+        for name, priority in rank_tier(members, TIER_TOP[state]).items():
+            priorities[name] = max(PRIORITY_FLOOR, round(priority * weight))
     return priorities
 
 
@@ -313,7 +395,8 @@ def describe(seat: Seat, priority: int) -> dict:
         "week_reset_epoch": seat.week_reset_epoch,
         "five_hour_reset_epoch": seat.five_hour_reset_epoch,
         "unavailable": seat.unavailable,
-        "reserve": seat.reserve,
+        "type": seat.kind,
+        "weight": seat.weight,
     }
 
 
@@ -321,13 +404,21 @@ def route_pool(pool: str, base_url: str) -> None:
     key = (KEY_DIR / f"{pool}.mgmt").read_text().strip()
     listing = call(base_url, key, "GET", "/auth-files")
     now = time.time()
-    entries = [entry for entry in listing.get("files", []) if entry.get("type") == "claude"]
+    entries = [
+        entry
+        for entry in listing.get("files", [])
+        if not SEAT_TYPES or str(entry.get("type") or "").lower() in SEAT_TYPES
+    ]
     guarded = apply_guard(pool, base_url, key, entries, now)
     seats = [
-        mark_reserve(read_seat(entry, now), pool)
+        with_weight(read_seat(entry, now), pool)
         for entry in entries
         if not entry.get("disabled") and entry["name"] not in guarded
     ]
+    for label in sorted(set(WEIGHTS.get(pool, {})) - {seat.label for seat in seats}):
+        if (pool, label) not in _reported:
+            _reported.add((pool, label))
+            log(f"{pool}: the weight for '{label}' matches no active seat. Check the name in ROUTER_SEAT_WEIGHTS.")
     priorities = plan(seats)
     changes = []
     for seat in seats:
@@ -406,8 +497,10 @@ def main() -> int:
         log("ROUTER_POOLS is empty. Set it to 'pool=url pool=url'.")
         return 2
     log(f"router started. Pools: {', '.join(pools)}. Interval: {INTERVAL_SECONDS} s.")
-    for pool, labels in RESERVE.items():
-        log(f"{pool}: reserve seats: {', '.join(sorted(labels))}")
+    for message in WEIGHT_ERRORS:
+        log(f"ROUTER_SEAT_WEIGHTS: {message}. The router ignores this item.")
+    for pool, weights in WEIGHTS.items():
+        log(f"{pool}: seat weights: {', '.join(f'{label}={weight:g}' for label, weight in sorted(weights.items()))}")
     once = "--once" in sys.argv
     if not once:
         serve_status()
