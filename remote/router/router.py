@@ -101,6 +101,8 @@ SEAT_TYPES = frozenset(os.environ.get("ROUTER_SEAT_TYPES", "").replace(",", " ")
 _sent: dict[tuple[str, str], int] = {}
 # The newest state of each pool, for the status endpoint.
 _latest: dict[str, dict] = {}
+# The seats that run on remembered quota, and that the log already has.
+_recalled: set[tuple[str, str]] = set()
 # The weight entries that name no seat, and that the log already has.
 _reported: set[tuple[str, str]] = set()
 
@@ -250,6 +252,55 @@ def read_seat(entry: dict, now: float) -> Seat:
     )
 
 
+def has_quota_view(seat: Seat) -> bool:
+    return any(
+        value is not None
+        for value in (seat.week_used, seat.week_hours_left, seat.five_hour_used, seat.five_hour_hours_left)
+    )
+
+
+def snapshot(seat: Seat) -> dict:
+    """Returns the quota of a seat in the form that the router keeps on disk."""
+    return {
+        "week_used": seat.week_used,
+        "week_reset_epoch": seat.week_reset_epoch,
+        "five_hour_used": seat.five_hour_used,
+        "five_hour_reset_epoch": seat.five_hour_reset_epoch,
+        "overage_open": seat.overage_open,
+    }
+
+
+def remembered_window(record: dict, name: str, now: float) -> tuple[float | None, float | None, int | None]:
+    """Returns a remembered window while its reset time is in the future."""
+    used = as_float(record.get(f"{name}_used"))
+    reset = as_float(record.get(f"{name}_reset_epoch"))
+    if used is None or reset is None or reset <= now:
+        return None, None, None
+    return used, (reset - now) / 3600.0, int(reset)
+
+
+def recall(seat: Seat, record: dict | None, now: float) -> Seat:
+    """Gives a seat with no quota view the quota that the router last saw.
+
+    The proxy loses its quota data when it restarts. Without this step, a full seat
+    then looks new and gets the top priority until the upstream rejects one request.
+    """
+    if not record or has_quota_view(seat):
+        return seat
+    week_used, week_hours_left, week_reset = remembered_window(record, "week", now)
+    five_hour_used, five_hour_hours_left, five_hour_reset = remembered_window(record, "five_hour", now)
+    return replace(
+        seat,
+        week_used=week_used,
+        week_hours_left=week_hours_left,
+        week_reset_epoch=week_reset,
+        five_hour_used=five_hour_used,
+        five_hour_hours_left=five_hour_hours_left,
+        five_hour_reset_epoch=five_hour_reset,
+        overage_open=bool(record.get("overage_open", False)),
+    )
+
+
 def with_weight(seat: Seat, pool: str) -> Seat:
     """Returns the seat with the weight that the settings give it in this pool."""
     return replace(seat, weight=WEIGHTS.get(pool, {}).get(seat.label, 1.0))
@@ -337,21 +388,59 @@ def guard_until(seat: Seat) -> int | None:
     return None
 
 
+def load_state(name: str) -> dict:
+    try:
+        data = json.loads((STATE_DIR / name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(name: str, data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temp = STATE_DIR / f"{name}.tmp"
+    temp.write_text(json.dumps(data))
+    temp.replace(STATE_DIR / name)
+
+
 def load_guard(pool: str) -> dict[str, int]:
     try:
-        return {str(k): int(v) for k, v in json.loads((STATE_DIR / f"{pool}.guard.json").read_text()).items()}
-    except (OSError, ValueError):
+        return {str(k): int(v) for k, v in load_state(f"{pool}.guard.json").items()}
+    except (TypeError, ValueError):
         return {}
 
 
 def save_guard(pool: str, record: dict[str, int]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    temp = STATE_DIR / f"{pool}.guard.json.tmp"
-    temp.write_text(json.dumps(record))
-    temp.replace(STATE_DIR / f"{pool}.guard.json")
+    save_state(f"{pool}.guard.json", record)
 
 
-def apply_guard(pool: str, base_url: str, key: str, entries: list[dict], now: float) -> dict[str, int]:
+def view_seats(pool: str, entries: list[dict], now: float) -> dict[str, Seat]:
+    """Reads each seat, and fills a seat with no quota view from the quota memory."""
+    memory = load_state(f"{pool}.quota.json")
+    updated: dict[str, dict] = {}
+    views: dict[str, Seat] = {}
+    for entry in entries:
+        name = entry["name"]
+        seat = read_seat(entry, now)
+        record = memory.get(name) if isinstance(memory.get(name), dict) else None
+        if has_quota_view(seat):
+            updated[name] = snapshot(seat)
+            _recalled.discard((pool, name))
+        elif record:
+            updated[name] = record
+            seat = recall(seat, record, now)
+            if has_quota_view(seat) and (pool, name) not in _recalled:
+                _recalled.add((pool, name))
+                log(f"{pool}: the proxy has no quota data for {seat.label}. The router uses the last known quota.")
+        views[name] = seat
+    if updated != memory:
+        save_state(f"{pool}.quota.json", updated)
+    return views
+
+
+def apply_guard(
+    pool: str, base_url: str, key: str, entries: list[dict], now: float, views: dict[str, Seat] | None = None
+) -> dict[str, int]:
     """Disables a seat that is about to bill extra usage and enables it after its reset.
 
     The record holds only the seats that the guard disabled. A seat that a person
@@ -369,7 +458,7 @@ def apply_guard(pool: str, base_url: str, key: str, entries: list[dict], now: fl
             continue
         if entry.get("disabled"):
             continue
-        until = guard_until(read_seat(entry, now))
+        until = guard_until(views[name] if views and name in views else read_seat(entry, now))
         if until is not None:
             call(base_url, key, "PATCH", "/auth-files/status", {"name": name, "disabled": True})
             updated[name] = until
@@ -409,9 +498,10 @@ def route_pool(pool: str, base_url: str) -> None:
         for entry in listing.get("files", [])
         if not SEAT_TYPES or str(entry.get("type") or "").lower() in SEAT_TYPES
     ]
-    guarded = apply_guard(pool, base_url, key, entries, now)
+    views = view_seats(pool, entries, now)
+    guarded = apply_guard(pool, base_url, key, entries, now, views)
     seats = [
-        with_weight(read_seat(entry, now), pool)
+        with_weight(views[entry["name"]], pool)
         for entry in entries
         if not entry.get("disabled") and entry["name"] not in guarded
     ]

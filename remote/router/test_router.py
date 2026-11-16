@@ -4,7 +4,7 @@ import unittest
 
 from dataclasses import replace
 
-from router import Seat, guard_until, parse_weights, plan, read_seat, state_of, window
+from router import Seat, guard_until, parse_weights, plan, read_seat, recall, snapshot, state_of, window
 
 
 def seat(name, week_used, week_hours_left, five_hour_used=0.0, unavailable=False):
@@ -157,6 +157,36 @@ class ProviderTest(unittest.TestCase):
         }}}
         result = read_seat(entry, now=1000.0)
         self.assertEqual((result.week_used, result.week_hours_left, result.week_reset_epoch), (0.5, 1.0, 4600))
+
+
+class MemoryTest(unittest.TestCase):
+    def full(self):
+        return replace(seat("a", 1.0, 50, five_hour_used=0.4), week_reset_epoch=9000, five_hour_reset_epoch=3000)
+
+    def test_seat_with_no_quota_view_gets_the_remembered_quota(self):
+        result = recall(seat("a", None, None, five_hour_used=None), snapshot(self.full()), now=2000.0)
+        self.assertEqual(state_of(result), "week_full")
+        self.assertEqual((result.week_used, result.week_reset_epoch), (1.0, 9000))
+        self.assertEqual(result.five_hour_used, 0.4)
+
+    def test_remembered_window_that_ended_is_not_used(self):
+        result = recall(seat("a", None, None, five_hour_used=None), snapshot(self.full()), now=10000.0)
+        self.assertIsNone(result.week_used)
+        self.assertIsNone(result.five_hour_used)
+        self.assertEqual(plan([result, seat("b", 0.5, 50)])["a"], 100)
+
+    def test_quota_from_the_proxy_wins_over_the_memory(self):
+        fresh = seat("a", 0.1, 160)
+        self.assertEqual(recall(fresh, snapshot(self.full()), now=2000.0), fresh)
+
+    def test_no_record_keeps_the_seat(self):
+        unknown = seat("a", None, None, five_hour_used=None)
+        self.assertEqual(recall(unknown, None, now=2000.0), unknown)
+
+    def test_remembered_full_seat_goes_below_an_open_seat(self):
+        full = recall(seat("full", None, None, five_hour_used=None), snapshot(self.full()), now=2000.0)
+        result = plan([full, seat("open", 0.0, 160)])
+        self.assertGreater(result["open"], result["full"])
 
 
 class SignalTest(unittest.TestCase):

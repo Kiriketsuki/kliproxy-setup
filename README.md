@@ -151,6 +151,10 @@ assignments. `./reroute.sh personal work` names the pools. It briefly interrupts
 requests of those pools. In each paused session, press Esc if it is waiting for a reset,
 then enter `continue`. This does not reset account quotas.
 
+A proxy loses its quota data when it restarts. The router keeps the last known quota of
+each seat in `router-state/<pool>.quota.json` and uses it until the proxy has new data.
+A full seat thus stays full after a restart, and no session gets a limit message from it.
+
 ## Spend guard
 
 The spend guard is for Claude accounts. An account with extra usage bills each request
