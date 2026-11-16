@@ -138,8 +138,13 @@ of the account email before the @ sign. A seat with no entry has the weight 1.
 - With a weight of 0.5, an `open` spare seat goes before a `warm` main seat. A pool with
   more than five main seats can also give a main seat a priority of 50 or less.
 - A full seat keeps the priority of its state. The weight does not change it.
-- A session that moved to a spare seat stays there while it is active, up to the affinity
-  time of one hour. `./reroute.sh` moves it back at once.
+- While a seat with a larger weight is `open`, the router puts the spare seat on standby.
+  It disables the seat in the proxy, so each session on it moves back to a main seat.
+  The status shows the seat with the state `standby`.
+- When no seat with a larger weight is `open`, the router enables the spare seat again.
+  That happens when the main seats are `warm`, so the spare seat is ready before they are
+  full. `ROUTER_STANDBY=0` turns standby off.
+- The router never enables a seat that a person disabled.
 - The router log names a weight entry that matches no seat.
 
 A seat change is costly. The session sends its whole history again as a cache write. Keep
@@ -170,7 +175,7 @@ curl -s -H "X-Api-Key: $(cat ~/.config/cliproxy/work.key)" "$(cat ~/.config/clip
 
 The answer lists each seat with `priority`, `state`, `week_used`, `week_hours_left`,
 `week_reset_epoch`, `five_hour_used`, `five_hour_hours_left`, `five_hour_reset_epoch`,
-`unavailable`, `type` and `weight`. It also gives `next_seat`, `extra_usage_open` and `spend_guard_blocked`.
+`unavailable`, `type` and `weight`. It also gives `next_seat`, `extra_usage_open`, `spend_guard_blocked` and `standby`.
 `./status.sh` prints the same data as a table.
 
 The pool configs set `passthrough-headers: true`. Claude Code then gets the rate-limit

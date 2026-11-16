@@ -44,6 +44,9 @@ FIVE_HOUR_WEIGHT = float(os.environ.get("ROUTER_5H_WEIGHT", "0.5"))
 # The spend guard blocks a seat that can bill extra usage, from this share of a window.
 GUARD_ENABLED = os.environ.get("ROUTER_SPEND_GUARD", "1") != "0"
 GUARD_LIMIT = float(os.environ.get("ROUTER_SPEND_GUARD_LIMIT", "0.97"))
+# Standby takes a seat out of the pool while a seat with a larger weight is open. Sessions
+# then go back to the main seats after a reset, and do not stay on a spare seat.
+STANDBY_ENABLED = os.environ.get("ROUTER_STANDBY", "1") != "0"
 KEY_DIR = Path(os.environ.get("ROUTER_KEY_DIR", "/keys"))
 STATE_DIR = Path(os.environ.get("ROUTER_STATE_DIR", "/state"))
 STATUS_PORT = int(os.environ.get("ROUTER_STATUS_PORT", "8320"))
@@ -372,6 +375,54 @@ def plan(seats: list[Seat]) -> dict[str, int]:
     return priorities
 
 
+def standby_names(seats: list[Seat]) -> set[str]:
+    """Returns the seats that must wait while a seat with a larger weight is open.
+
+    The proxy keeps a session on its seat after a seat with a larger priority gets quota
+    again. A spare seat thus keeps its sessions unless the router takes it out of the
+    pool. A warm seat does not count as open, so the spare seat is back in the pool
+    before the main seat is full.
+    """
+    best: dict[str, float] = {}
+    for seat in seats:
+        if state_of(seat) == "open":
+            best[seat.kind] = max(best.get(seat.kind, 0.0), seat.weight)
+    return {seat.name for seat in seats if seat.weight < best.get(seat.kind, 0.0)}
+
+
+def apply_standby(
+    pool: str, base_url: str, key: str, entries: list[dict], seats: dict[str, Seat], guarded: dict[str, int]
+) -> tuple[set[str], set[str]]:
+    """Disables each seat that must wait and enables it when no larger seat is open.
+
+    Returns the seats on standby and the seats that this cycle enabled again. The record
+    holds only the seats that this step disabled. A seat that a person disabled is not
+    in the record, so this step never enables it.
+    """
+    record = set(load_state(f"{pool}.standby.json"))
+    active = [
+        seats[entry["name"]]
+        for entry in entries
+        if entry["name"] not in guarded and (not entry.get("disabled") or entry["name"] in record)
+    ]
+    wanted = standby_names(active) if STANDBY_ENABLED else set()
+    updated: set[str] = set()
+    released: set[str] = set()
+    for seat in active:
+        if seat.name in wanted:
+            if seat.name not in record:
+                call(base_url, key, "PATCH", "/auth-files/status", {"name": seat.name, "disabled": True})
+                log(f"{pool}: {seat.label} is on standby. A seat with a larger weight is open.")
+            updated.add(seat.name)
+        elif seat.name in record:
+            call(base_url, key, "PATCH", "/auth-files/status", {"name": seat.name, "disabled": False})
+            released.add(seat.name)
+            log(f"{pool}: {seat.label} is back in the pool. No seat with a larger weight is open.")
+    if updated != record:
+        save_state(f"{pool}.standby.json", {name: 1 for name in sorted(updated)})
+    return updated, released
+
+
 def guard_until(seat: Seat) -> int | None:
     """Returns the time until which the spend guard must block a seat, or None.
 
@@ -472,11 +523,11 @@ def rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
-def describe(seat: Seat, priority: int) -> dict:
+def describe(seat: Seat, priority: int, state: str | None = None) -> dict:
     return {
         "seat": seat.label,
         "priority": priority,
-        "state": state_of(seat),
+        "state": state or state_of(seat),
         "week_used": seat.week_used,
         "week_hours_left": rounded(seat.week_hours_left),
         "five_hour_used": seat.five_hour_used,
@@ -498,17 +549,20 @@ def route_pool(pool: str, base_url: str) -> None:
         for entry in listing.get("files", [])
         if not SEAT_TYPES or str(entry.get("type") or "").lower() in SEAT_TYPES
     ]
-    views = view_seats(pool, entries, now)
+    views = {name: with_weight(seat, pool) for name, seat in view_seats(pool, entries, now).items()}
     guarded = apply_guard(pool, base_url, key, entries, now, views)
+    waiting, released = apply_standby(pool, base_url, key, entries, views, guarded)
     seats = [
-        with_weight(views[entry["name"]], pool)
+        views[entry["name"]]
         for entry in entries
-        if not entry.get("disabled") and entry["name"] not in guarded
+        if (not entry.get("disabled") or entry["name"] in released)
+        and entry["name"] not in guarded
+        and entry["name"] not in waiting
     ]
-    for label in sorted(set(WEIGHTS.get(pool, {})) - {seat.label for seat in seats}):
+    for label in sorted(set(WEIGHTS.get(pool, {})) - {seat.label for seat in views.values()}):
         if (pool, label) not in _reported:
             _reported.add((pool, label))
-            log(f"{pool}: the weight for '{label}' matches no active seat. Check the name in ROUTER_SEAT_WEIGHTS.")
+            log(f"{pool}: the weight for '{label}' matches no seat. Check the name in ROUTER_SEAT_WEIGHTS.")
     priorities = plan(seats)
     changes = []
     for seat in seats:
@@ -522,6 +576,8 @@ def route_pool(pool: str, base_url: str) -> None:
         (describe(seat, priorities[seat.name]) for seat in seats),
         key=lambda row: (-row["priority"], row["seat"]),
     )
+    # A seat on standby takes no session. The status shows it below each active seat.
+    rows += sorted((describe(views[name], 0, "standby") for name in waiting), key=lambda row: row["seat"])
     state = {
         "pool": pool,
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -529,6 +585,7 @@ def route_pool(pool: str, base_url: str) -> None:
         "next_seat": rows[0]["seat"] if rows else None,
         "extra_usage_open": sorted(seat.label for seat in seats if seat.overage_open),
         "spend_guard_blocked": sorted(name for name in guarded),
+        "standby": sorted(views[name].label for name in waiting),
         "seats": rows,
     }
     _latest[pool] = state

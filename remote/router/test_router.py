@@ -4,7 +4,7 @@ import unittest
 
 from dataclasses import replace
 
-from router import Seat, guard_until, parse_weights, plan, read_seat, recall, snapshot, state_of, window
+from router import Seat, guard_until, parse_weights, plan, read_seat, recall, snapshot, standby_names, state_of, window
 
 
 def seat(name, week_used, week_hours_left, five_hour_used=0.0, unavailable=False):
@@ -157,6 +157,39 @@ class ProviderTest(unittest.TestCase):
         }}}
         result = read_seat(entry, now=1000.0)
         self.assertEqual((result.week_used, result.week_hours_left, result.week_reset_epoch), (0.5, 1.0, 4600))
+
+
+class StandbyTest(unittest.TestCase):
+    def spare(self, weight=0.05):
+        return replace(seat("spare", 0.5, 100), weight=weight)
+
+    def test_spare_seat_waits_while_a_main_seat_is_open(self):
+        self.assertEqual(standby_names([self.spare(), seat("main", 0.1, 160)]), {"spare"})
+
+    def test_spare_seat_serves_when_the_main_seat_is_full(self):
+        full = seat("main", 0.1, 160, five_hour_used=1.0)
+        self.assertEqual(standby_names([self.spare(), full, seat("week", 0.99, 5)]), set())
+
+    def test_spare_seat_is_back_before_the_main_seat_is_full(self):
+        warm = seat("main", 0.1, 160, five_hour_used=0.9)
+        self.assertEqual(state_of(warm), "warm")
+        self.assertEqual(standby_names([self.spare(), warm]), set())
+
+    def test_seat_in_cooldown_does_not_keep_the_spare_seat_out(self):
+        self.assertEqual(standby_names([self.spare(), seat("main", 0.1, 160, unavailable=True)]), set())
+
+    def test_each_smaller_weight_waits_for_each_larger_weight(self):
+        half, last = self.spare(0.5), replace(seat("last", 0.5, 100), weight=0.05)
+        full = seat("main", 0.1, 160, five_hour_used=1.0)
+        self.assertEqual(standby_names([half, last, seat("main", 0.1, 160)]), {"spare", "last"})
+        self.assertEqual(standby_names([half, last, full]), {"last"})
+
+    def test_seats_with_equal_weight_never_wait(self):
+        self.assertEqual(standby_names([seat("a", 0.1, 160), seat("b", 0.9, 10)]), set())
+
+    def test_seat_of_a_different_type_does_not_keep_the_spare_seat_out(self):
+        codex = replace(seat("codex", 0.1, 160), kind="codex")
+        self.assertEqual(standby_names([self.spare(), codex]), set())
 
 
 class MemoryTest(unittest.TestCase):
